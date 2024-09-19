@@ -7,6 +7,8 @@ import (
     "gopkg.in/yaml.v3"
     "os"
     "os/exec"
+    "runtime"
+    "slices"
     "strings"
     "time"
 )
@@ -79,18 +81,41 @@ func run(myConfig *config.Config) {
 }
 
 func isConnectedToWiFi(ssids []string) bool {
-    out, err := exec.Command("networksetup", "-getairportnetwork", "en0").Output()
+    ssid, err := getSSID()
+    fmt.Println("SSID: " + ssid)
     if err != nil {
         fmt.Println("Error checking Wi-Fi connection:", err)
         return false
     }
-    fmt.Println(strings.TrimSpace(string(out)))
-    for _, ssid := range ssids {
-        if strings.TrimSpace(string(out)) == fmt.Sprintf("Current Wi-Fi Network: %s", ssid) {
-            return true
-        }
+    return slices.Contains(ssids, ssid)
+}
+
+func getSSID() (string, error) {
+    switch runtime.GOOS {
+    case "darwin":
+        return getSSIDMacOS()
+    //case "windows":
+    //    return getSSIDWindows()
+    //case "linux":
+    //    return getSSIDLinux()
+    default:
+        return "", fmt.Errorf("unsupported platform")
     }
-    return false
+}
+
+func getSSIDMacOS() (string, error) {
+    out, err := exec.Command("networksetup", "-getairportnetwork", "en0").Output()
+    if err != nil {
+        fmt.Println("Error checking Wi-Fi connection:", err)
+        return "", err
+    }
+    outStr := strings.TrimSpace(string(out))
+    if strings.HasPrefix(outStr, "Current Wi-Fi Network: ") {
+        ssid := strings.TrimPrefix(outStr, "Current Wi-Fi Network: ")
+        return ssid, nil
+    } else {
+        return "", fmt.Errorf(outStr)
+    }
 }
 
 //这里要注意兼容SwitchHosts，不要相互覆盖
