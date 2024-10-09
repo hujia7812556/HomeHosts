@@ -2,13 +2,19 @@ package main
 
 import (
     "HomeHosts/config"
+    "bytes"
     "flag"
     "fmt"
+    "github.com/hashicorp/go-version"
+    "github.com/kardianos/service"
     "gopkg.in/yaml.v3"
+    "log"
     "os"
     "os/exec"
+    "regexp"
     "runtime"
     "slices"
+    "strconv"
     "strings"
     "time"
 )
@@ -37,20 +43,25 @@ func main() {
 
     switch *serviceType {
     case "install":
-        installLaunchAgent()
-        return
+        installService()
     case "uninstall":
-        uninstallLaunchAgent()
-        return
+        uninstallService()
+    case "restart":
+        restartService()
     case "modify":
         modifyHostsFile(&myConfig)
         return
     case "restore":
         restoreHostsFile()
-        return
     default:
-        run(&myConfig)
-        return
+        s := getService()
+        status, _ := s.Status()
+        if status != service.StatusUnknown {
+            // 以服务方式运行
+            s.Run()
+        } else {
+            run(&myConfig)
+        }
     }
 }
 
@@ -104,18 +115,57 @@ func getSSID() (string, error) {
 }
 
 func getSSIDMacOS() (string, error) {
-    out, err := exec.Command("networksetup", "-getairportnetwork", "en0").Output()
+    osVersion, _ := getMacVersion()
+    fmt.Println("os version: " + osVersion)
+    currentVersion, _ := version.NewVersion(osVersion)
+    version15, _ := version.NewVersion("15.0.0")
+    version145, _ := version.NewVersion("14.5.0")
+    version144, _ := version.NewVersion("14.4.0")
+    version1369, _ := version.NewVersion("13.6.9")
+    var out []byte
+    var err error
+    if currentVersion.GreaterThanOrEqual(version15) {
+        cmd := "system_profiler SPAirPortDataType | awk '/Current Network Information:/ { getline; print substr($0, 13, (length($0) - 13)); exit }'"
+        out, err = exec.Command("bash", "-c", cmd).Output()
+    } else if currentVersion.GreaterThanOrEqual(version145) {
+        cmd := "/usr/sbin/networksetup -getairportnetwork en0 | /usr/bin/awk -F \": \" '{ print $2 }'"
+        out, err = exec.Command("bash", "-c", cmd).Output()
+    } else if currentVersion.GreaterThanOrEqual(version144) {
+        cmd := "/usr/bin/wdutil info | /usr/bin/awk '/SSID/ { print $NF }' | head -n 1"
+        out, err = exec.Command("bash", "-c", cmd).Output()
+    } else if currentVersion.GreaterThanOrEqual(version1369) {
+        cmd := "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/A/Resources/airport --getinfo | /usr/bin/awk '/ SSID/{print $NF}'"
+        out, err = exec.Command("bash", "-c", cmd).Output()
+    } else {
+        out = []byte("")
+        err = fmt.Errorf("os version is rather low")
+    }
+
     if err != nil {
         fmt.Println("Error checking Wi-Fi connection:", err)
         return "", err
     }
-    outStr := strings.TrimSpace(string(out))
-    if strings.HasPrefix(outStr, "Current Wi-Fi Network: ") {
-        ssid := strings.TrimPrefix(outStr, "Current Wi-Fi Network: ")
-        return ssid, nil
-    } else {
-        return "", fmt.Errorf(outStr)
+    return strings.TrimSpace(string(out)), nil
+}
+
+func getMacVersion() (string, error) {
+    // 使用 sw_vers 命令来获取 macOS 版本信息
+    cmd := exec.Command("sw_vers")
+    var out bytes.Buffer
+    cmd.Stdout = &out
+    err := cmd.Run()
+    if err != nil {
+        return "", err
     }
+
+    // 根据输出处理版本信息
+    versionInfo := out.String()
+    re := regexp.MustCompile(`ProductVersion:\s*(.+)`)
+    matches := re.FindStringSubmatch(versionInfo)
+    if len(matches) > 1 {
+        return matches[1], nil
+    }
+    return "", fmt.Errorf("macOS version not found")
 }
 
 //这里要注意兼容SwitchHosts，不要相互覆盖
@@ -274,47 +324,175 @@ func getDefaultConfigFilePath() string {
     return homeDir + "/.HomeHosts/config.yaml"
 }
 
-func installLaunchAgent() {
-    plistTemplate := `<plist version="1.0">
-<dict>
-    <key>KeepAlive</key>
-    <true/>
-    <key>Label</key>
-    <string>com.jerehu.HomeHosts</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/home-hosts</string>
-        <string>-f</string>
-        <string>%d</string>
-        <string>-c</string>
-        <string>%s</string>
-    </array>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>/var/log/home-hosts.err.log</string>
-    <key>StandardOutPath</key>
-    <string>/var/log/home-hosts.out.log</string>
-</dict>
-</plist>`
-    plistContent := fmt.Sprintf(plistTemplate, *every, *configFilePath)
+type program struct{}
 
-    // 将 plist 文件写入 /Library/LaunchDaemons/
-    plistFile := os.ExpandEnv("/Library/LaunchDaemons/com.jerehu.HomeHosts.plist")
-    os.WriteFile(plistFile, []byte(plistContent), 0644)
-    exec.Command("launchctl", "load", plistFile).Run()
-    fmt.Println("Launch agent installed.")
+func (p *program) Start(s service.Service) error {
+    // Start should not block. Do the actual work async.
+    go p.run()
+    return nil
+}
+func (p *program) run() {
+    run(&myConfig)
+}
+func (p *program) Stop(s service.Service) error {
+    // Stop should not block. Return with a few seconds.
+    return nil
 }
 
-func uninstallLaunchAgent() {
-    plistFile := os.ExpandEnv("/Library/LaunchDaemons/com.jerehu.HomeHosts.plist")
-    exec.Command("launchctl", "unload", plistFile).Run()
-    err := os.Remove(plistFile)
-    if err != nil {
-        fmt.Println(err.Error())
-        return
+func installService() {
+    s := getService()
+
+    status, err := s.Status()
+    if err != nil && status == service.StatusUnknown {
+        // 服务未知，创建服务
+        if err = s.Install(); err == nil {
+            s.Start()
+            fmt.Println("安装 home-hosts 服务成功! ")
+            if service.ChosenSystem().String() == "unix-systemv" {
+                if _, err := exec.Command("/etc/init.d/home-hosts", "enable").Output(); err != nil {
+                    log.Println(err)
+                }
+                if _, err := exec.Command("/etc/init.d/home-hosts", "start").Output(); err != nil {
+                    log.Println(err)
+                }
+            }
+            return
+        }
+        fmt.Println("安装 home-hosts 服务失败, 异常信息: %s", err)
     }
-    fmt.Println("Launch agent uninstalled.")
+
+    if status != service.StatusUnknown {
+        fmt.Println("home-hosts 服务已安装, 无需再次安装")
+    }
 }
+
+func uninstallService() {
+    s := getService()
+    s.Stop()
+    if service.ChosenSystem().String() == "unix-systemv" {
+        if _, err := exec.Command("/etc/init.d/home-hosts", "stop").Output(); err != nil {
+            log.Println(err)
+        }
+    }
+    if err := s.Uninstall(); err == nil {
+        fmt.Println("home-hosts 服务卸载成功")
+    } else {
+        fmt.Println("home-hosts 服务卸载失败, 异常信息: %s", err)
+    }
+}
+
+func restartService() {
+    s := getService()
+    status, err := s.Status()
+    if err == nil {
+        if status == service.StatusRunning {
+            if err = s.Restart(); err == nil {
+                fmt.Println("重启 home-hosts 服务成功")
+            }
+        } else if status == service.StatusStopped {
+            if err = s.Start(); err == nil {
+                fmt.Println("启动 home-hosts 服务成功")
+            }
+        }
+    } else {
+        fmt.Println("home-hosts 服务未安装, 请先安装服务")
+    }
+}
+
+func getService() service.Service {
+    options := make(service.KeyValue)
+    var depends []string
+
+    // 确保服务等待网络就绪后再启动
+    switch service.ChosenSystem().String() {
+    case "unix-systemv":
+        options["SysvScript"] = sysvScript
+    case "windows-service":
+        // 将 Windows 服务的启动类型设为自动(延迟启动)
+        options["DelayedAutoStart"] = true
+    default:
+        // 向 Systemd 添加网络依赖
+        depends = append(depends, "Requires=network.target",
+            "After=network-online.target")
+    }
+
+    svcConfig := &service.Config{
+        Name:         "home-hosts",
+        DisplayName:  "home-hosts",
+        Description:  "根据wifi名自动切换本地hosts",
+        Arguments:    []string{"-c", *configFilePath, "-f", strconv.Itoa(*every)},
+        Dependencies: depends,
+        Option:       options,
+    }
+
+    prg := &program{}
+    s, err := service.New(prg, svcConfig)
+    if err != nil {
+        log.Fatalln(err)
+    }
+    return s
+}
+
+const sysvScript = `#!/bin/sh /etc/rc.common
+DESCRIPTION="{{.Description}}"
+cmd="{{.Path}}{{range .Arguments}} {{.|cmd}}{{end}}"
+name="home-hosts"
+pid_file="/var/run/$name.pid"
+stdout_log="/var/log/$name.log"
+stderr_log="/var/log/$name.err"
+START=99
+get_pid() {
+    cat "$pid_file"
+}
+is_running() {
+    [ -f "$pid_file" ] && cat /proc/$(get_pid)/stat > /dev/null 2>&1
+}
+start() {
+	if is_running; then
+		echo "Already started"
+	else
+		echo "Starting $name"
+		{{if .WorkingDirectory}}cd '{{.WorkingDirectory}}'{{end}}
+		$cmd >> "$stdout_log" 2>> "$stderr_log" &
+		echo $! > "$pid_file"
+		if ! is_running; then
+			echo "Unable to start, see $stdout_log and $stderr_log"
+			exit 1
+		fi
+	fi
+}
+stop() {
+	if is_running; then
+		echo -n "Stopping $name.."
+		kill $(get_pid)
+		for i in $(seq 1 10)
+		do
+			if ! is_running; then
+				break
+			fi
+			echo -n "."
+			sleep 1
+		done
+		echo
+		if is_running; then
+			echo "Not stopped; may still be shutting down or shutdown may have failed"
+			exit 1
+		else
+			echo "Stopped"
+			if [ -f "$pid_file" ]; then
+				rm "$pid_file"
+			fi
+		fi
+	else
+		echo "Not running"
+	fi
+}
+restart() {
+	stop
+	if is_running; then
+		echo "Unable to stop, will not attempt to start"
+		exit 1
+	fi
+	start
+}
+`
